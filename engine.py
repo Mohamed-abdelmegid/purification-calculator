@@ -166,6 +166,7 @@ class Result:
     rows: list = field(default_factory=list)         # [Row] مكونات عائد المرابحات
     warnings: list = field(default_factory=list)
     scanned: bool = False
+    derived_fin: tuple = None
 
 
 def read_pages(path):
@@ -246,7 +247,28 @@ def parse_income_statement(text):
             if key == "finance_income" and max(abs(a) for a in amts) < 1000:
                 continue
             found[key] = (title, *cur_prev(amts))
+    if "finance_income" not in found:                      # OCR مشوّه لعنوان الصف: نشتقه = صافي + تكلفة
+        d = derive_finance(text)
+        if d:
+            found["finance_income"] = (IS_KEYS[0][1], *d)
     return found
+
+
+def derive_finance(text):
+    """عائد المرابحات = صافي الدخل من العائد + تكلفة الودائع (للتحقق من قراءة الـ OCR)."""
+    net = cost = None
+    for label, amts, _, _own in logical_rows(text):
+        n = norm(label)
+        if not amts:
+            continue
+        if net is None and ("netinterest" in n or "netincomefromfunds" in n or "netrevenuesfromfunds" in n
+                            or "صافيالدخلمنالعايد" in n or "صافيالدخلمنالعائد" in n):
+            net = cur_prev(amts)
+        if cost is None and ("costof" in n or "تكلفهالودايع" in n or "تكلفهالودائع" in n):
+            cost = cur_prev(amts)
+    if net and cost:
+        return net[0] + abs(cost[0]), net[1] + abs(cost[1])
+    return None
 
 
 def _fmt(x):
@@ -284,8 +306,13 @@ def classify(label, section):
 
 
 def parse_note(text, finance_cur):
-    """يقرأ تفصيل عائد المرابحات. بيرجع (rows, sum_cur)."""
-    rows, running, started = [], 0.0, False
+    rows, running, _ = parse_note_full(text, finance_cur)
+    return rows, running
+
+
+def parse_note_full(text, finance_cur):
+    """يقرأ تفصيل عائد المرابحات. بيرجع (rows, sum_cur, total_printed) — total_printed = آخر صف إجمالي مطبوع."""
+    rows, running, started, last_total = [], 0.0, False, None
     for label, amts, section, own in logical_rows(text):
         n = norm(label)
         if not started:
@@ -300,6 +327,8 @@ def parse_note(text, finance_cur):
         if not amts:
             continue
         if any(t in n for t in _TOTAL):
+            if rows:
+                last_total = cur_prev(amts)
             continue
         letters = re.sub(r"[^A-Za-z\u0600-\u06FF]", "", label)
         first = re.sub(r"[^a-z]", "", (label.split() or [""])[0].lower())
@@ -311,9 +340,13 @@ def parse_note(text, finance_cur):
         st, why = classify(label, section)
         rows.append(Row((own or label).strip(" :-"), cur, prev, st, why))
         running += cur
-        if finance_cur and abs(running - finance_cur) < 1.5:
+        if finance_cur and abs(running - finance_cur) < 1.5 and not _more_rows_ahead(text, label):
             break
-    return rows, running
+    return rows, running, last_total
+
+
+def _more_rows_ahead(text, label):
+    return False
 
 
 # ---------------------------------------------------------------- التحليل
@@ -323,6 +356,16 @@ def _find_is_page(texts):
         if len(inc) >= 4 and "finance_income" in inc:
             return i + 1, inc
     return 0, {}
+
+
+def _looks_like_is(text):
+    n = norm(text)
+    head = n[:400]
+    if "comprehensive" in head or "الشامل" in head:
+        return False
+    if not any(k in head for k in ("incomestatement", "statementofincome", "profitorloss", "قائمهالدخل")):
+        return False
+    return len(parse_income_statement(text)) >= 3
 
 
 def _find_note_candidates(texts, is_page, finance_cur, finance_prev):
@@ -376,7 +419,41 @@ def vision_rows(path, page, api_key, model="claude-sonnet-5-5"):
     return rows
 
 
+def _fix_fin_from_total(res, total):
+    """لو إجمالي الإيضاح المطبوع = مجموع بنوده (قراءة سليمة) ورقم قائمة الدخل مختلف -> نصحّح قائمة الدخل."""
+    if not (total and res.rows and "finance_income" in res.income):
+        return
+    t, c, p = res.income["finance_income"]
+    sc, sp = sum(r.cur for r in res.rows), sum(r.prev for r in res.rows)
+    new_c = total[0] if abs(sc - total[0]) < 1.5 and abs(c - total[0]) >= 1.5 else c
+    new_p = total[1] if abs(sp - total[1]) < 1.5 and abs(p - total[1]) >= 1.5 else p
+    if (new_c, new_p) != (c, p):
+        res.income["finance_income"] = (t, new_c, new_p)
+        res.warnings.append(f"تم تصحيح عائد المرابحات في قائمة الدخل من {_fmt(c)} إلى {_fmt(new_c)} "
+                            "(خطأ قراءة OCR؛ الرقم الجديد يطابق إجمالي الإيضاح ومجموع بنوده).")
+
+
+def _fix_fin_from_note(res):
+    """لو رقم عائد المرابحات المقروء بالـ OCR غلط وتفصيل الإيضاح بيطابق (صافي + تكلفة) نصحّحه."""
+    if not (res.rows and "finance_income" in res.income):
+        return
+    t, c, p = res.income["finance_income"]
+    sc, sp = sum(r.cur for r in res.rows), sum(r.prev for r in res.rows)
+    new_c, new_p = c, p
+    d = res.derived_fin
+    if abs(sc - c) >= 1.5 and d and abs(sc - d[0]) < 1.5:
+        new_c = d[0]
+    if abs(sp - p) >= 1.5 and d and abs(sp - d[1]) < 1.5:
+        new_p = d[1]
+    if (new_c, new_p) != (c, p):
+        res.income["finance_income"] = (t, new_c, new_p)
+        res.warnings.append(f"تم تصحيح عائد المرابحات في قائمة الدخل من {_fmt(c)} إلى {_fmt(new_c)} "
+                            "(خطأ قراءة OCR؛ الرقم الجديد يطابق الإيضاح ومعادلة صافي + تكلفة).")
+
+
 def _check_sums(res, fin):
+    _fix_fin_from_note(res)
+    fin = res.income.get("finance_income", fin)
     for idx, nm in ((0, "الحالية"), (1, "السابقة")):
         s = sum((r.cur if idx == 0 else r.prev) for r in res.rows)
         if abs(s - fin[1 + idx]) >= 1.5:
@@ -427,14 +504,16 @@ def analyze(path, allow_ocr=True, progress=None, api_key=None):
         cand = front_weak if not res.scanned else list(range(3, min(n_pages, 16) + 1))
         found = ocr_pages(path, cand, dpi=120)
         for p in cand:
-            if len(parse_income_statement(found[p])) >= 4:
+            if _looks_like_is(found[p]):
                 res.is_page = p
                 break
         if not res.is_page:
             res.warnings.append("لم أجد قائمة الدخل في الصفحات الأولى.")
             return res
         say("OCR: قراءة قائمة الدخل بدقة أعلى")
-        res.income = parse_income_statement(ocr_pages(path, [res.is_page], dpi=250, psm=6)[res.is_page])
+        is_txt = ocr_pages(path, [res.is_page], dpi=250, psm=6)[res.is_page]
+        res.income = parse_income_statement(is_txt)
+        res.derived_fin = derive_finance(is_txt)
         if "finance_income" not in res.income:
             res.warnings.append("تعذرت قراءة عائد المرابحات من الصورة.")
             return res
@@ -483,20 +562,38 @@ def analyze(path, allow_ocr=True, progress=None, api_key=None):
         return res
     res.method = "ocr"
     say("OCR: البحث عن إيضاح عائد المرابحات")
+    best, tried = None, 0
     for k in range(0, len(pages), 8):
         chunk = pages[k:k + 8]
         low = ocr_pages(path, chunk, dpi=105)
         for p in chunk:
             n = norm(low[p])
-            if ("murabaha" in n or "revenuesfromfunds" in n or "incomefromfunds" in n) and \
-               len(re.findall(r"\d{1,3}(?:[,.]\d{3}){2,}", low[p])) >= 5:
-                say("OCR: قراءة الإيضاح بدقة أعلى")
-                txt = ocr_pages(path, [p], dpi=250, psm=6)[p]
-                rows, s = parse_note(txt, fin[1])
-                if rows:
-                    res.note_page, res.rows = p, rows
-                    _check_sums(res, fin)
-                    return res
+            if "cashflow" in n[:300] or "financialposition" in n[:300]:
+                continue
+            if not (("murabaha" in n or "revenuesfromfunds" in n or "incomefromfunds" in n or "netinterest" in n)
+                    and ("costof" in n or "netinterest" in n or "netrevenues" in n)
+                    and len(re.findall(r"\d{1,3}(?:[,.]\d{3}){2,}", low[p])) >= 5):
+                continue
+            tried += 1
+            say("OCR: قراءة الإيضاح بدقة أعلى")
+            txt = ocr_pages(path, [p], dpi=250, psm=6)[p]
+            rows, s_, tot = parse_note_full(txt, fin[1])
+            if not rows:
+                continue
+            verified = bool(tot) and abs(s_ - tot[0]) < 1.5
+            if abs(s_ - fin[1]) < 1.5 or verified or (res.derived_fin and abs(s_ - res.derived_fin[0]) < 1.5):
+                res.note_page, res.rows = p, rows
+                _fix_fin_from_total(res, tot)
+                _check_sums(res, fin)
+                return res
+            if best is None or abs(s_ - fin[1]) < best[2]:
+                best = (p, rows, abs(s_ - fin[1]))
+        if tried >= 4:
+            break
+    if best:
+        res.note_page, res.rows = best[0], best[1]
+        _check_sums(res, fin)
+        return res
     res.warnings.append("لم أجد إيضاح تفصيل عائد المرابحات. أدخل المكونات يدوياً.")
     return res
 
